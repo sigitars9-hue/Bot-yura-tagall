@@ -10,6 +10,48 @@ const client = new Client({
 });
 
 /* =========================
+   LOGGING -> CSV
+   ========================= */
+const LOG_DIR = path.join(__dirname, 'data');
+const LOG_PATH = path.join(LOG_DIR, 'activity_log.csv');
+
+function ensureLogReady() {
+  if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
+  if (!fs.existsSync(LOG_PATH)) {
+    fs.writeFileSync(
+      LOG_PATH,
+      [
+        'timestamp_iso',
+        'group_id',
+        'group_name',
+        'contact_id',
+        'contact_name',
+        'phone_last4',
+        'message',
+      ].join(',') + '\n',
+      'utf8'
+    );
+  }
+}
+function appendCsvRow(obj) {
+  const esc = (v) => {
+    const s = (v ?? '').toString().replace(/\r?\n|\r/g, ' ').trim();
+    if (/[",]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+    return s;
+  };
+  const row = [
+    esc(obj.timestamp_iso),
+    esc(obj.group_id),
+    esc(obj.group_name),
+    esc(obj.contact_id),
+    esc(obj.contact_name),
+    esc(obj.phone_last4),
+    esc(obj.message),
+  ].join(',') + '\n';
+  fs.appendFileSync(LOG_PATH, row, 'utf8');
+}
+
+/* =========================
    HELPER: ADMIN & UTIL
    ========================= */
 function getParticipant(chat, widSerialized) {
@@ -134,6 +176,51 @@ client.on('message', async (msg) => {
       );
 
       await chat.sendMessage(headerText || '👋', { mentions: contacts });
+      return;
+    }
+
+    /* ===== !aktif [N] ===== */
+    if (cmd === '!aktif') {
+      if (!chat.isGroup) return msg.reply('Perintah ini hanya untuk grup.');
+
+      ensureLogReady();
+      const content = fs.readFileSync(LOG_PATH, 'utf8');
+      const lines = content.trim().split('\n').slice(1);
+      const groupId = chat.id?._serialized;
+
+      const counts = new Map();
+      for (const line of lines) {
+        const cols = parseCsvLine(line);
+        if (!cols.length) continue;
+        const gId = cols[1];
+        if (gId !== groupId) continue;
+
+        const cId = cols[3];
+        const cName = cols[4];
+        const l4 = cols[5];
+
+        const prev = counts.get(cId) || { count: 0, name: cName, last4: l4 };
+        prev.count += 1;
+        if (!prev.name && cName) prev.name = cName;
+        if (!prev.last4 && l4) prev.last4 = l4;
+        counts.set(cId, prev);
+      }
+
+      const limit = Math.max(1, Math.min(50, parseInt(args[0], 10) || 10));
+      const ranking = [...counts.entries()]
+        .sort((a, b) => b[1].count - a[1].count)
+        .slice(0, limit);
+
+      if (!ranking.length) {
+        return msg.reply('Belum ada data aktivitas untuk grup ini.');
+      }
+
+      const linesMsg = ranking.map(([cid, d], i) => {
+        const label = (d.name ? d.name : cid.replace('@c.us', '')) + (d.last4 ? ` (#${d.last4})` : '');
+        return `${i + 1}. ${label} — ${d.count} pesan`;
+      });
+
+      await msg.reply(`📊 Top ${limit} member paling aktif di *${chat.name}*:\n` + linesMsg.join('\n'));
       return;
     }
 
