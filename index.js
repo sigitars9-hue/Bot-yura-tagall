@@ -6,9 +6,12 @@ const path = require('path');
 
 const client = new Client({
   authStrategy: new LocalAuth(),
-  puppeteer: { args: ['--no-sandbox', '--disable-setuid-sandbox'] },
+  puppeteer: {
+    headless: true,
+    executablePath: '/usr/bin/chromium-browser', // atau '/usr/bin/chromium'
+    args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage']
+  },
 });
-
 /* =========================
    LOGGING -> CSV
    ========================= */
