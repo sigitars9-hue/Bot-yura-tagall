@@ -3,15 +3,29 @@ const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 
+// ── ffmpeg
+const ffmpeg = require('fluent-ffmpeg');
+let ffmpegPath;
+try {
+  ffmpegPath = require('ffmpeg-static');
+  if (ffmpegPath) ffmpeg.setFfmpegPath(ffmpegPath);
+} catch {}
+// fallback biarkan ffmpeg dari sistem jika ada
+
+/* =========================
+   CLIENT
+   ========================= */
 const client = new Client({
   authStrategy: new LocalAuth(),
   puppeteer: {
     headless: true,
-    executablePath: '/usr/bin/chromium-browser', // atau '/usr/bin/chromium'
+    executablePath: '/usr/bin/chromium-browser', // sesuaikan dengan servermu
     args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage']
   },
 });
+
 /* =========================
    LOGGING -> CSV
    ========================= */
@@ -70,7 +84,7 @@ async function isSenderAdmin(chat, msg) {
   const part = getParticipant(chat, senderWid);
   return isParticipantAdmin(part);
 }
-async function isBotAdmin(chat, client) {
+async function isBotAdmin(chat) {
   try { if (typeof chat.fetchParticipants === 'function') await chat.fetchParticipants(); } catch {}
   const botWid = client.info?.wid?._serialized;
   const part = getParticipant(chat, botWid);
@@ -104,7 +118,98 @@ function parseCsvLine(line) {
 }
 
 /* =========================
-   STIKER (gambar only)
+   STICKER UTILS (IMG, GIF/VIDEO)
+   ========================= */
+const INV = '\u2063'; // filler invisible untuk tagall tanpa baris baru
+const TMP_DIR = path.join(__dirname, 'tmp');
+if (!fs.existsSync(TMP_DIR)) fs.mkdirSync(TMP_DIR, { recursive: true });
+
+function writeTmp(buf, ext) {
+  const p = path.join(TMP_DIR, `${Date.now()}_${Math.random().toString(36).slice(2)}.${ext}`);
+  fs.writeFileSync(p, buf);
+  return p;
+}
+function readB64(p) {
+  const b = fs.readFileSync(p);
+  return b.toString('base64');
+}
+function mimeExt(mimetype) {
+  if (!mimetype) return 'bin';
+  if (mimetype.includes('png')) return 'png';
+  if (mimetype.includes('jpeg') || mimetype.includes('jpg')) return 'jpg';
+  if (mimetype.includes('webp')) return 'webp';
+  if (mimetype.includes('gif')) return 'gif';
+  if (mimetype.includes('mp4')) return 'mp4';
+  if (mimetype.includes('quicktime')) return 'mov';
+  if (mimetype.includes('webm')) return 'webm';
+  if (mimetype.includes('video')) return 'mp4';
+  if (mimetype.includes('image')) return 'jpg';
+  return 'bin';
+}
+
+// agar stabil: dimensi genap + padding transparan ke 512×512 (AR terjaga)
+function buildPadFilter(fps = null) {
+  const base = [
+    "scale='if(gt(iw,ih),512,-2)':'if(gt(ih,iw),512,-2)':flags=lanczos:force_original_aspect_ratio=decrease",
+    "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+    "format=rgba",
+    "pad=512:512:(ow-iw)/2:(oh-ih)/2:color=0x00000000"
+  ].join(',');
+  return fps ? `${base},fps=${fps}` : base;
+}
+
+async function toStaticWebpBuffer(inputPath) {
+  const outPath = path.join(TMP_DIR, `out_${Date.now()}.webp`);
+  const vf = buildPadFilter();
+  await new Promise((resolve, reject) => {
+    ffmpeg(inputPath)
+      .outputOptions([
+        '-vcodec', 'libwebp',
+        '-filter:v', vf,
+        '-lossless', '0',
+        '-qscale', '60',
+        '-an',
+        '-vsync', '0',
+        '-threads', '1'
+      ])
+      .output(outPath)
+      .on('end', resolve)
+      .on('error', reject)
+      .run();
+  });
+  const b64 = readB64(outPath);
+  try { fs.unlinkSync(outPath); } catch {}
+  return b64;
+}
+
+async function toAnimatedWebpBuffer(inputPath, { fps = 15, maxSec = 6 } = {}) {
+  const outPath = path.join(TMP_DIR, `out_${Date.now()}.webp`);
+  const vf = buildPadFilter(fps);
+  await new Promise((resolve, reject) => {
+    ffmpeg(inputPath)
+      .outputOptions([
+        '-vcodec', 'libwebp',
+        '-filter:v', vf,
+        '-loop', '0',
+        '-lossless', '0',
+        '-qscale', '65',
+        '-an',
+        '-vsync', '0',
+        '-t', String(maxSec),
+        '-threads', '1'
+      ])
+      .output(outPath)
+      .on('end', resolve)
+      .on('error', reject)
+      .run();
+  });
+  const b64 = readB64(outPath);
+  try { fs.unlinkSync(outPath); } catch {}
+  return b64;
+}
+
+/* =========================
+   STICKER METADATA
    ========================= */
 function parseStickerMeta(args) {
   const joined = args.join(' ').trim();
@@ -112,13 +217,9 @@ function parseStickerMeta(args) {
   const [author, pack] = joined.split('|').map(s => (s || '').trim());
   return { author: author || 'Bot', pack: pack || 'Sticker' };
 }
-async function createStickerFromImage(mediaBase64, meta) {
-  const media = new MessageMedia('image/jpeg', mediaBase64);
-  return { media, options: { sendMediaAsSticker: true, stickerAuthor: meta.author, stickerName: meta.pack } };
-}
 
 /* =========================
-   EVENT
+   EVENTS
    ========================= */
 client.on('qr', (qr) => {
   console.log('Scan QR berikut di WhatsApp (Linked Devices):');
@@ -129,10 +230,10 @@ client.on('ready', () => {
   ensureLogReady();
   console.log('✅ Bot siap!');
   console.log('Perintah:');
-  console.log('• !tagall [pesan opsional]');
-  console.log('• !aktif [jumlah]  -> top member aktif di grup ini (default 10, max 50)');
+  console.log('• !tagall [pesan opsional]  (admin only, tanpa baris baru)');
+  console.log('• !aktif [jumlah]           (default 10, max 50)');
   console.log('• !admindebug');
-  console.log('• !stiker [author|pack]  (reply ke gambar saja)');
+  console.log('• !stiker [author|pack]     (reply ke gambar/GIF/video)');
   console.log('📁 Log: ' + LOG_PATH);
 });
 
@@ -167,18 +268,27 @@ client.on('message', async (msg) => {
     const cmd = cmdRaw.toLowerCase();
     const args = argsRaw;
 
-    /* ===== !tagall ===== */
+    /* ===== !tagall (ADMIN ONLY, TANPA BARIS BARU) ===== */
     if (cmd === '!tagall') {
       if (!chat.isGroup) return msg.reply('Perintah ini hanya untuk grup.');
-      const rawText = msg.body.slice('!tagall'.length).trim();
-      const headerText = rawText.length ? msg.body.slice(8).trim() : 'Ping semua member 👋';
+      const allowed = await isSenderAdmin(chat, msg);
+      if (!allowed) return msg.reply('Maaf, perintah ini hanya untuk admin.');
 
+      const rawText = msg.body.slice('!tagall'.length).trim();
+      const headerText = rawText.length ? rawText : 'Ping semua member 👋';
+
+      // Ambil mentions
+      try { if (typeof chat.fetchParticipants === 'function') await chat.fetchParticipants(); } catch {}
       const participants = chat.participants || [];
+      if (!participants.length) return msg.reply('Tidak ada anggota ditemukan.');
+
       const contacts = await Promise.all(
         participants.map((p) => client.getContactById(p.id._serialized))
       );
 
-      await chat.sendMessage(headerText || '👋', { mentions: contacts });
+      // Filler invisible TANPA \n agar tidak bikin baris baru
+      const filler = INV.repeat(Math.max(1, contacts.length));
+      await chat.sendMessage(headerText + filler, { mentions: contacts });
       return;
     }
 
@@ -247,7 +357,7 @@ client.on('message', async (msg) => {
       );
     }
 
-    /* ===== !stiker (gambar only) ===== */
+    /* ===== !stiker (gambar / GIF / video) ===== */
     if (cmd === '!stiker' || cmd === '!sticker') {
       let targetMsg = msg;
       if (msg.hasQuotedMsg) {
@@ -255,7 +365,7 @@ client.on('message', async (msg) => {
       }
 
       if (!targetMsg.hasMedia) {
-        return msg.reply('Balas (reply) ke gambar, lalu kirim `!stiker [author|pack]`.');
+        return msg.reply('Balas (reply) ke gambar / GIF / video, lalu kirim `!stiker [author|pack]`.');
       }
 
       const meta = parseStickerMeta(args);
@@ -264,14 +374,43 @@ client.on('message', async (msg) => {
         return msg.reply('Gagal mengunduh media. Coba lagi.');
       }
 
-      if (media.mimetype.startsWith('image/')) {
-        const payload = await createStickerFromImage(media.data, meta);
-        await msg.reply('Membuat stiker…');
-        await chat.sendMessage(payload.media, payload.options);
-        return;
+      // batasan ukuran & durasi agar aman
+      const MAX_BYTES = 15 * 1024 * 1024;
+      const buf = Buffer.from(media.data, 'base64');
+      if (buf.length > MAX_BYTES) {
+        return msg.reply('File terlalu besar. Maksimal ~15MB.');
       }
 
-      return msg.reply('⚠️ Saat ini hanya gambar yang bisa dijadikan stiker.');
+      try {
+        const ext = mimeExt(media.mimetype);
+        const inPath = writeTmp(buf, ext);
+
+        let outB64;
+        if (media.mimetype.startsWith('image/')) {
+          // gambar → webp statis
+          outB64 = await toStaticWebpBuffer(inPath);
+        } else if (media.mimetype.startsWith('video/') || ext === 'gif') {
+          // GIF / video → webp animasi
+          outB64 = await toAnimatedWebpBuffer(inPath, { fps: 15, maxSec: 6 });
+        } else {
+          try { fs.unlinkSync(inPath); } catch {}
+          return msg.reply('Format tidak didukung untuk stiker.');
+        }
+
+        try { fs.unlinkSync(inPath); } catch {}
+
+        const stickerMedia = new MessageMedia('image/webp', outB64);
+        await chat.sendMessage(stickerMedia, {
+          sendMediaAsSticker: true,
+          stickerAuthor: meta.author,
+          stickerName: meta.pack,
+        });
+      } catch (e) {
+        console.error('Sticker convert error:', e);
+        return msg.reply('Gagal membuat stiker. Coba media lain atau lebih pendek.');
+      }
+
+      return;
     }
 
   } catch (err) {
