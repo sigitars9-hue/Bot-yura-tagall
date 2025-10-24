@@ -20,8 +20,8 @@ if (ffmpegPath) ffmpeg.setFfmpegPath(ffmpegPath);
 
 // ───────────────────────── Config ─────────────────────────
 const CMD_PREFIX = process.env.CMD_PREFIX || '!';
-const AUTH_DIR = process.env.AUTH_DIR || './auth';
-const BOT_NAME = process.env.BOT_NAME || 'YuraBot';
+const AUTH_DIR   = process.env.AUTH_DIR   || './auth';
+const BOT_NAME   = process.env.BOT_NAME   || 'YuraBot';
 
 // Invisible separator agar mention notify tanpa tampil @tag
 const INV = '\u2063'; // U+2063
@@ -45,51 +45,74 @@ async function messageToBuffer(sock, msg) {
 
   if (quoted?.imageMessage) mediaNode = { type: 'imageMessage', node: quoted.imageMessage };
   else if (quoted?.videoMessage) mediaNode = { type: 'videoMessage', node: quoted.videoMessage };
-  else if (quoted?.documentMessage && /image|video/.test(quoted.documentMessage.mimetype))
+  else if (quoted?.documentMessage && /image|video|gif/.test(quoted.documentMessage.mimetype || ''))
     mediaNode = { type: 'documentMessage', node: quoted.documentMessage };
 
   if (!mediaNode) {
     if (m.imageMessage) mediaNode = { type: 'imageMessage', node: m.imageMessage };
     else if (m.videoMessage) mediaNode = { type: 'videoMessage', node: m.videoMessage };
-    else if (m.documentMessage && /image|video/.test(m.documentMessage.mimetype))
+    else if (m.documentMessage && /image|video|gif/.test(m.documentMessage.mimetype || ''))
       mediaNode = { type: 'documentMessage', node: m.documentMessage };
   }
 
   if (!mediaNode) return { buffer: null, isVideo: false };
 
-  const stream = await downloadContentFromMessage(mediaNode.node, mediaNode.type.replace('Message', ''));
+  const stream = await downloadContentFromMessage(
+    mediaNode.node,
+    mediaNode.type.replace('Message', '')
+  );
   const chunks = [];
   for await (const c of stream) chunks.push(c);
   const buffer = Buffer.concat(chunks);
-  const isVideo = mediaNode.type === 'videoMessage' || /video/.test(mediaNode?.node?.mimetype || '');
+  const mime = mediaNode?.node?.mimetype || '';
+  const isVideo = mediaNode.type === 'videoMessage' || /video|gif/i.test(mime);
   return { buffer, isVideo };
+}
+
+// ─────────────── Util: Filter string aman ───────────────
+function buildSquarePadFilter({ fps = null } = {}) {
+  // 1) scale sisi terpanjang ke 512 (AR tetap)
+  // 2) paksa dimensi genap (hindari error filter)
+  // 3) ubah ke RGBA (transparansi)
+  // 4) pad ke 512x512 (center) transparan
+  const base =
+    "scale='if(gt(iw,ih),512,-2)':'if(gt(ih,iw),512,-2)':flags=lanczos:force_original_aspect_ratio=decrease," +
+    "scale=trunc(iw/2)*2:trunc(ih/2)*2," +
+    "format=rgba,pad=512:512:(ow-iw)/2:(oh-ih)/2:color=0x00000000";
+  return fps ? `${base},fps=${fps}` : base;
 }
 
 // ─────────────── Util: Convert buffer → WebP (stiker) ───────────────
 async function toWebpBuffer(inputBuffer, { isVideo = false } = {}) {
   const tmpDir = path.join(process.cwd(), 'tmp');
   await fs.mkdir(tmpDir, { recursive: true });
-  const inPath = path.join(tmpDir, `in_${Date.now()}`);
+  const inPath  = path.join(tmpDir, `in_${Date.now()}`);
   const outPath = path.join(tmpDir, `out_${Date.now()}.webp`);
   await fs.writeFile(inPath, inputBuffer);
 
-  const optsImage = [
+  const vf = buildSquarePadFilter({ fps: isVideo ? 15 : null });
+
+  const optsCommon = [
     '-vcodec', 'libwebp',
-    '-vf', 'scale=512:512:force_original_aspect_ratio=decrease',
-    '-preset', 'default',
+    '-filter:v', vf,
     '-an',
     '-vsync', '0',
-    '-s', '512:512'
+    '-preset', 'default',
+    '-threads', '1' // stabil & hemat
   ];
+
+  const optsImage = [
+    ...optsCommon,
+    '-lossless', '0',
+    '-qscale', '60'
+  ];
+
   const optsVideo = [
-    '-vcodec', 'libwebp',
-    '-vf', 'scale=512:512:force_original_aspect_ratio=decrease,fps=20',
-    '-preset', 'default',
-    '-an',
-    '-vsync', '0',
-    '-s', '512:512',
+    ...optsCommon,
     '-loop', '0',
-    '-lossless', '1'
+    '-lossless', '0',
+    '-qscale', '65',
+    '-t', '6' // batasi ~6s untuk ukuran/kompatibilitas
   ];
 
   await new Promise((resolve, reject) => {
@@ -111,16 +134,17 @@ async function toWebpBuffer(inputBuffer, { isVideo = false } = {}) {
 // ─────────────── Fitur: TagAll hanya untuk Admin ───────────────
 async function cmdTagAll(sock, msg, textArg) {
   const from = msg.key.remoteJid;
-  const sender = msg.key.participant || msg.key.remoteJid; // pengirim
+  const sender = msg.key.participant || msg.key.remoteJid;
 
   if (!from?.endsWith('@g.us')) {
     await sock.sendMessage(from, { text: 'Perintah ini hanya bisa digunakan di grup, kak 💬' }, { quoted: msg });
     return;
   }
 
-  // Ambil metadata grup & cek apakah pengirim adalah admin
   const meta = await sock.groupMetadata(from);
-  const adminList = meta.participants.filter(p => p.admin === 'admin' || p.admin === 'superadmin').map(p => p.id);
+  const adminList = meta.participants
+    .filter(p => p.admin === 'admin' || p.admin === 'superadmin')
+    .map(p => p.id);
 
   const isAdmin = adminList.includes(sender);
   if (!isAdmin) {
@@ -128,20 +152,17 @@ async function cmdTagAll(sock, msg, textArg) {
     return;
   }
 
-  // Ambil semua member
   const participants = (meta.participants || []).map(p => p.id);
   if (!participants.length) {
     await sock.sendMessage(from, { text: 'Tidak ada anggota ditemukan 😕' }, { quoted: msg });
     return;
   }
 
-  const filler = participants.map(() => INV).join(' ');
-  const teks = (textArg && textArg.trim().length ? textArg.trim() : 'Penting nih kak!') + '\n' + filler;
+  // TANPA baris baru
+  const filler = participants.map(() => INV).join('');
+  const teks = (textArg?.trim() || 'Penting nih kak!') + filler;
 
-  await sock.sendMessage(from, {
-    text: teks,
-    mentions: participants
-  }, { quoted: msg });
+  await sock.sendMessage(from, { text: teks, mentions: participants }, { quoted: msg });
 }
 
 // ─────────────── Fitur: Sticker ───────────────
@@ -150,7 +171,7 @@ async function cmdSticker(sock, msg) {
   const from = msg.key.remoteJid;
 
   if (!buffer) {
-    await sock.sendMessage(from, { text: 'Reply/kirim gambar atau video dengan caption !sticker.' }, { quoted: msg });
+    await sock.sendMessage(from, { text: 'Reply/kirim gambar atau video/GIF dengan caption !sticker.' }, { quoted: msg });
     return;
   }
 
@@ -160,15 +181,20 @@ async function cmdSticker(sock, msg) {
     return;
   }
 
-  const webp = await toWebpBuffer(buffer, { isVideo });
-  await sock.sendMessage(from, { sticker: webp }, { quoted: msg });
+  try {
+    const webp = await toWebpBuffer(buffer, { isVideo });
+    await sock.sendMessage(from, { sticker: webp }, { quoted: msg });
+  } catch (e) {
+    console.error('Sticker convert error:', e);
+    await sock.sendMessage(from, { text: 'Gagal membuat stiker. Coba kirim ulang atau durasi lebih pendek.' }, { quoted: msg });
+  }
 }
 
 // ─────────────── Router Command ───────────────
 function parseCommand(txt) {
   if (!txt || !txt.startsWith(CMD_PREFIX)) return null;
   const cut = txt.slice(CMD_PREFIX.length).trim();
-  const [cmd, ...rest] = cut.split(/\s+/);
+  const [cmd] = cut.split(/\s+/);
   const argText = cut.slice(cmd.length).trim();
   return { cmd: cmd.toLowerCase(), argText };
 }
@@ -215,22 +241,17 @@ async function start() {
       if (!parsed) return;
 
       const { cmd, argText } = parsed;
-      if (cmd === 'tagall') {
-        await cmdTagAll(sock, msg, argText);
-        return;
-      }
-      if (cmd === 'sticker' || cmd === 's' || cmd === 'stiker') {
-        await cmdSticker(sock, msg);
-        return;
-      }
+      if (cmd === 'tagall')   return void (await cmdTagAll(sock, msg, argText));
+      if (cmd === 'sticker' || cmd === 's' || cmd === 'stiker')
+        return void (await cmdSticker(sock, msg));
 
       if (cmd === 'help' || cmd === 'menu') {
         const help = [
           `*${BOT_NAME}*`,
           `Prefix: ${CMD_PREFIX}`,
           '',
-          `• ${CMD_PREFIX}tagall [pesan]  → Mention semua (admin only)`,
-          `• ${CMD_PREFIX}sticker (reply gambar/video) → Jadikan stiker`,
+          `• ${CMD_PREFIX}tagall [pesan]  → Mention semua (admin only, tanpa baris baru)`,
+          `• ${CMD_PREFIX}sticker (reply gambar/video/GIF) → Stiker (AR terjaga, padding transparan, ≤6s utk animasi)`,
         ].join('\n');
         await sock.sendMessage(msg.key.remoteJid, { text: help }, { quoted: msg });
       }
