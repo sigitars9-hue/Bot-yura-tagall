@@ -1,4 +1,4 @@
-// index.js
+// index.js (Final)
 import 'dotenv/config';
 import makeWASocket, {
   useMultiFileAuthState,
@@ -37,7 +37,7 @@ function getTextFromMessage(msg) {
   return '';
 }
 
-// ─────────────── Util: Ambil media (quoted/inline) → Buffer ───────────────
+// ─────────────── Util: Ambil media (quoted/inline) → Buffer & info ───────────────
 async function messageToBuffer(sock, msg) {
   const m = msg.message || {};
   const quoted = m?.extendedTextMessage?.contextInfo?.quotedMessage;
@@ -45,13 +45,13 @@ async function messageToBuffer(sock, msg) {
 
   if (quoted?.imageMessage) mediaNode = { type: 'imageMessage', node: quoted.imageMessage };
   else if (quoted?.videoMessage) mediaNode = { type: 'videoMessage', node: quoted.videoMessage };
-  else if (quoted?.documentMessage && /image|video|gif/.test(quoted.documentMessage.mimetype || ''))
+  else if (quoted?.documentMessage && /image|video|gif/i.test(quoted.documentMessage.mimetype || ''))
     mediaNode = { type: 'documentMessage', node: quoted.documentMessage };
 
   if (!mediaNode) {
     if (m.imageMessage) mediaNode = { type: 'imageMessage', node: m.imageMessage };
     else if (m.videoMessage) mediaNode = { type: 'videoMessage', node: m.videoMessage };
-    else if (m.documentMessage && /image|video|gif/.test(m.documentMessage.mimetype || ''))
+    else if (m.documentMessage && /image|video|gif/i.test(m.documentMessage.mimetype || ''))
       mediaNode = { type: 'documentMessage', node: m.documentMessage };
   }
 
@@ -64,25 +64,30 @@ async function messageToBuffer(sock, msg) {
   const chunks = [];
   for await (const c of stream) chunks.push(c);
   const buffer = Buffer.concat(chunks);
+
   const mime = mediaNode?.node?.mimetype || '';
+  // GIF sering datang sebagai video/gif di mime
   const isVideo = mediaNode.type === 'videoMessage' || /video|gif/i.test(mime);
   return { buffer, isVideo };
 }
 
-// ─────────────── Util: Filter string aman ───────────────
-function buildSquarePadFilter({ fps = null } = {}) {
-  // 1) scale sisi terpanjang ke 512 (AR tetap)
-  // 2) paksa dimensi genap (hindari error filter)
-  // 3) ubah ke RGBA (transparansi)
-  // 4) pad ke 512x512 (center) transparan
+// ─────────────── Filter builder (stabil) ───────────────
+function buildStableWebpFilters(fps = null) {
+  // 1) Scale sisi terpanjang ke 512 (AR tetap)
+  // 2) Normalkan SAR = 1
+  // 3) Paksa dimensi genap (hindari error filter)
+  // 4) RGBA
+  // 5) Pad ke 512x512 transparan (center)
   const base =
     "scale='if(gt(iw,ih),512,-2)':'if(gt(ih,iw),512,-2)':flags=lanczos:force_original_aspect_ratio=decrease," +
+    "setsar=1," +
     "scale=trunc(iw/2)*2:trunc(ih/2)*2," +
-    "format=rgba,pad=512:512:(ow-iw)/2:(oh-ih)/2:color=0x00000000";
+    "format=rgba," +
+    "pad=512:512:(ow-iw)/2:(oh-ih)/2:color=0x00000000";
   return fps ? `${base},fps=${fps}` : base;
 }
 
-// ─────────────── Util: Convert buffer → WebP (stiker) ───────────────
+// ─────────────── Convert → WEBP (statis/animasi) ───────────────
 async function toWebpBuffer(inputBuffer, { isVideo = false } = {}) {
   const tmpDir = path.join(process.cwd(), 'tmp');
   await fs.mkdir(tmpDir, { recursive: true });
@@ -90,34 +95,35 @@ async function toWebpBuffer(inputBuffer, { isVideo = false } = {}) {
   const outPath = path.join(tmpDir, `out_${Date.now()}.webp`);
   await fs.writeFile(inPath, inputBuffer);
 
-  const vf = buildSquarePadFilter({ fps: isVideo ? 15 : null });
+  const vf = buildStableWebpFilters(isVideo ? 15 : null);
 
-  const optsCommon = [
-    '-vcodec', 'libwebp',
+  const common = [
     '-filter:v', vf,
     '-an',
     '-vsync', '0',
     '-preset', 'default',
-    '-threads', '1' // stabil & hemat
+    '-threads', '1'
   ];
 
-  const optsImage = [
-    ...optsCommon,
+  const imageOpts = [
+    '-vcodec', 'libwebp',
+    ...common,
     '-lossless', '0',
     '-qscale', '60'
   ];
 
-  const optsVideo = [
-    ...optsCommon,
+  const videoOpts = [
+    '-vcodec', 'libwebp',
+    ...common,
     '-loop', '0',
     '-lossless', '0',
     '-qscale', '65',
-    '-t', '6' // batasi ~6s untuk ukuran/kompatibilitas
+    '-t', '6' // batasi durasi animasi agar kecil & kompatibel
   ];
 
   await new Promise((resolve, reject) => {
     ffmpeg(inPath)
-      .outputOptions(isVideo ? optsVideo : optsImage)
+      .outputOptions(isVideo ? videoOpts : imageOpts)
       .output(outPath)
       .on('end', resolve)
       .on('error', reject)
@@ -125,13 +131,50 @@ async function toWebpBuffer(inputBuffer, { isVideo = false } = {}) {
   });
 
   const out = await fs.readFile(outPath).finally(async () => {
-    await fs.unlink(inPath).catch(() => {});
-    await fs.unlink(outPath).catch(() => {});
+    await fs.unlink(inPath).catch(()=>{});
+    await fs.unlink(outPath).catch(()=>{});
   });
   return out;
 }
 
-// ─────────────── Fitur: TagAll hanya untuk Admin ───────────────
+// ─────────────── Fallback → GIF-like MP4 (kalau WEBP gagal) ───────────────
+async function toGifLikeMp4(inputBuffer, { fps = 15, maxSec = 6 } = {}) {
+  const tmpDir = path.join(process.cwd(), 'tmp');
+  await fs.mkdir(tmpDir, { recursive: true });
+  const inPath  = path.join(tmpDir, `in_${Date.now()}`);
+  const outPath = path.join(tmpDir, `out_${Date.now()}.mp4`);
+  await fs.writeFile(inPath, inputBuffer);
+
+  const vf =
+    "scale='if(gt(iw,ih),512,-2)':'if(gt(ih,iw),512,-2)':flags=lanczos:force_original_aspect_ratio=decrease," +
+    "setsar=1,scale=trunc(iw/2)*2:trunc(ih/2)*2,fps=" + String(fps);
+
+  await new Promise((resolve, reject) => {
+    ffmpeg(inPath)
+      .outputOptions([
+        '-movflags', '+faststart',
+        '-pix_fmt', 'yuv420p',
+        '-filter:v', vf,
+        '-an',
+        '-r', String(fps),
+        '-t', String(maxSec),
+        '-threads', '1'
+      ])
+      .videoCodec('libx264')
+      .output(outPath)
+      .on('end', resolve)
+      .on('error', reject)
+      .run();
+  });
+
+  const out = await fs.readFile(outPath).finally(async () => {
+    await fs.unlink(inPath).catch(()=>{});
+    await fs.unlink(outPath).catch(()=>{});
+  });
+  return out;
+}
+
+// ─────────────── Fitur: TagAll (admin-only, tanpa baris baru) ───────────────
 async function cmdTagAll(sock, msg, textArg) {
   const from = msg.key.remoteJid;
   const sender = msg.key.participant || msg.key.remoteJid;
@@ -158,7 +201,7 @@ async function cmdTagAll(sock, msg, textArg) {
     return;
   }
 
-  // TANPA baris baru
+  // TANPA baris baru/space
   const filler = participants.map(() => INV).join('');
   const teks = (textArg?.trim() || 'Penting nih kak!') + filler;
 
@@ -185,8 +228,14 @@ async function cmdSticker(sock, msg) {
     const webp = await toWebpBuffer(buffer, { isVideo });
     await sock.sendMessage(from, { sticker: webp }, { quoted: msg });
   } catch (e) {
-    console.error('Sticker convert error:', e);
-    await sock.sendMessage(from, { text: 'Gagal membuat stiker. Coba kirim ulang atau durasi lebih pendek.' }, { quoted: msg });
+    console.error('Sticker WEBP failed, fallback to gif-like mp4:', e);
+    try {
+      const mp4 = await toGifLikeMp4(buffer, { fps: 15, maxSec: 6 });
+      await sock.sendMessage(from, { video: mp4, gifPlayback: true }, { quoted: msg });
+    } catch (e2) {
+      console.error('Fallback mp4 failed:', e2);
+      await sock.sendMessage(from, { text: 'Gagal membuat stiker. Coba durasi lebih pendek atau resolusi lebih kecil.' }, { quoted: msg });
+    }
   }
 }
 
@@ -203,6 +252,8 @@ function parseCommand(txt) {
 async function start() {
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
   const { version } = await fetchLatestBaileysVersion();
+
+  console.log('[Init] Using ffmpeg:', ffmpegPath || 'system ffmpeg on PATH');
 
   const sock = makeWASocket({
     version,
@@ -251,7 +302,10 @@ async function start() {
           `Prefix: ${CMD_PREFIX}`,
           '',
           `• ${CMD_PREFIX}tagall [pesan]  → Mention semua (admin only, tanpa baris baru)`,
-          `• ${CMD_PREFIX}sticker (reply gambar/video/GIF) → Stiker (AR terjaga, padding transparan, ≤6s utk animasi)`,
+          `• ${CMD_PREFIX}sticker (reply gambar/video/GIF) →`,
+          `   - Gambar → stiker statis WEBP (AR terjaga + padding transparan)`,
+          `   - GIF/Video → stiker animasi WEBP (≤ ~6s, fps 15) `,
+          `     (fallback MP4 gifPlayback bila WEBP gagal)`,
         ].join('\n');
         await sock.sendMessage(msg.key.remoteJid, { text: help }, { quoted: msg });
       }
